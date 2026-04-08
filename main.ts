@@ -20,6 +20,71 @@ const DEFAULT_SETTINGS: ConvertBase64ToPNGSettings = {
 const LOG_FILENAME = 'debug.log';
 const MAX_LOG_SIZE = 1024 * 1024; // 1 MB
 
+interface Base64Match {
+	fullMatch: string;
+	altText: string;
+	imageType: string;
+	base64Data: string;
+	/** Which syntax pattern matched */
+	syntax: 'inline' | 'reference' | 'html';
+	/** For reference-style: the reference id so we can also remove the usage */
+	refId?: string;
+}
+
+// Inline: ![alt](data:image/png;base64,...)
+const INLINE_REGEX = /!\[(.*?)\]\(data:image\/([a-zA-Z+]+);base64,([^)]+)\)/g;
+// Reference definition: [id]: <data:image/png;base64,...> or without angle brackets
+const REFERENCE_DEF_REGEX = /^\[([^\]]+)\]:\s*<?data:image\/([a-zA-Z+]+);base64,([^>\s]+)>?$/gm;
+// HTML img: <img ... src="data:image/png;base64,..." ...>
+const HTML_IMG_REGEX = /<img[^>]+src=["']data:image\/([a-zA-Z+]+);base64,([^"']+)["'][^>]*>/g;
+
+function findBase64Images(content: string): Base64Match[] {
+	const matches: Base64Match[] = [];
+
+	let m;
+	while ((m = INLINE_REGEX.exec(content)) !== null) {
+		matches.push({
+			fullMatch: m[0],
+			altText: m[1],
+			imageType: m[2],
+			base64Data: m[3],
+			syntax: 'inline',
+		});
+	}
+
+	while ((m = REFERENCE_DEF_REGEX.exec(content)) !== null) {
+		matches.push({
+			fullMatch: m[0],
+			altText: m[1],
+			imageType: m[2],
+			base64Data: m[3],
+			syntax: 'reference',
+			refId: m[1],
+		});
+	}
+
+	while ((m = HTML_IMG_REGEX.exec(content)) !== null) {
+		const altMatch = m[0].match(/alt=["']([^"']*)["']/);
+		matches.push({
+			fullMatch: m[0],
+			altText: altMatch ? altMatch[1] : '',
+			imageType: m[1],
+			base64Data: m[2],
+			syntax: 'html',
+		});
+	}
+
+	return matches;
+}
+
+function containsBase64(content: string): boolean {
+	return content.includes('data:image/') && content.includes(';base64,');
+}
+
+function escapeRegex(s: string): string {
+	return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
 export default class ConvertBase64ToPNGPlugin extends Plugin {
 	settings: ConvertBase64ToPNGSettings;
 
@@ -121,10 +186,8 @@ export default class ConvertBase64ToPNGPlugin extends Plugin {
 		await this.saveData(this.settings);
 	}
 
-	// Check if content contains base64 image
 	containsBase64Image(content: string): boolean {
-		const base64Regex = /!\[.*?\]\(data:image\/[a-zA-Z]+;base64,([^)]+)\)/g;
-		return base64Regex.test(content);
+		return containsBase64(content);
 	}
 
 	// Convert base64 images in current file
@@ -150,22 +213,9 @@ export default class ConvertBase64ToPNGPlugin extends Plugin {
 		log.info('Starting conversion for file:', file.path);
 
 		const content = editor.getValue();
-		const base64Regex = /!\[(.*?)\]\(data:image\/([a-zA-Z]+);base64,([^)]+)\)/g;
-
-		let match;
 		let newContent = content;
 		let conversionCount = 0;
-		const matches = [];
-
-		// Find all matches first
-		while ((match = base64Regex.exec(content)) !== null) {
-			matches.push({
-				fullMatch: match[0],
-				altText: match[1],
-				imageType: match[2],
-				base64Data: match[3]
-			});
-		}
+		const matches = findBase64Images(content);
 
 		if (matches.length === 0) {
 			log.debug('No base64 images found in file:', file.path);
@@ -173,7 +223,8 @@ export default class ConvertBase64ToPNGPlugin extends Plugin {
 			return;
 		}
 
-		log.info(`Found ${matches.length} base64 image(s) in file:`, file.path);
+		log.info(`Found ${matches.length} base64 image(s) in file:`, file.path,
+			matches.map(m => `[${m.syntax}: type=${m.imageType}, base64 len=${m.base64Data.length}]`).join(', '));
 
 		// Create output folder if it doesn't exist
 		const filePath = file.path;
@@ -201,14 +252,22 @@ export default class ConvertBase64ToPNGPlugin extends Plugin {
 				const imagePath = normalizePath(`${outputFolderPath}/${filename}`);
 				const relativeImagePath = normalizePath(`${this.settings.outputFolder}/${filename}`);
 
-				log.debug(`Converting image ${i + 1}: type=${match.imageType}, base64 length=${match.base64Data.length}, output=${imagePath}`);
+				log.debug(`Converting image ${i + 1}/${matches.length}: syntax=${match.syntax}, type=${match.imageType}, base64 length=${match.base64Data.length}, output=${imagePath}`);
 
 				const binaryData = base64ToArrayBuffer(match.base64Data);
 				await this.app.vault.adapter.writeBinary(imagePath, binaryData);
 
-				// Replace in content
+				// Replace in content — for reference-style, replace the definition line
+				// and update any usages like ![alt][refId] to ![alt](path)
 				const newImageMarkdown = `![${match.altText}](${relativeImagePath})`;
 				newContent = newContent.replace(match.fullMatch, newImageMarkdown);
+				if (match.syntax === 'reference' && match.refId) {
+					// Replace usages of the reference: ![alt][refId] or ![refId]
+					const refUsage = new RegExp(`!\\[([^\\]]*)\\]\\[${escapeRegex(match.refId)}\\]`, 'g');
+					newContent = newContent.replace(refUsage, (_, alt) => `![${alt}](${relativeImagePath})`);
+					const shortRefUsage = new RegExp(`!\\[${escapeRegex(match.refId)}\\](?!\\[|\\()`, 'g');
+					newContent = newContent.replace(shortRefUsage, `![${match.refId}](${relativeImagePath})`);
+				}
 
 				conversionCount++;
 				log.debug(`Image ${i + 1} saved to ${imagePath}`);
@@ -233,77 +292,86 @@ export default class ConvertBase64ToPNGPlugin extends Plugin {
 		log.info(`Starting batch conversion across ${files.length} files`);
 		new Notice(`Processing ${files.length} files...`);
 
+		let filesWithBase64 = 0;
+
 		for (const file of files) {
 			try {
-				// Get file content
 				const content = await this.app.vault.read(file);
 
-				// Check if file contains base64 images
-				if (this.containsBase64Image(content)) {
-					// Count base64 images in the file
-					const base64Regex = /!\[(.*?)\]\(data:image\/([a-zA-Z]+);base64,([^)]+)\)/g;
-					let matches = [];
-					let match;
-					while ((match = base64Regex.exec(content)) !== null) {
-						matches.push(match);
-					}
+				if (!this.containsBase64Image(content)) {
+					processedFiles++;
+					continue;
+				}
 
-					// Process the file directly instead of using the editor-based function
-					let newContent = content;
-					let fileConversionCount = 0;
+				filesWithBase64++;
+				const matches = findBase64Images(content);
 
-					// Create output folder if it doesn't exist
-					const filePath = file.path;
-					const fileDir = filePath.substring(0, filePath.lastIndexOf('/'));
-					const outputFolderPath = normalizePath(`${fileDir}/${this.settings.outputFolder}`);
+				if (matches.length === 0) {
+					log.warn(`File contains 'data:image/...;base64,' but no regex matched: ${file.path}`);
+					log.debug(`First 200 chars around base64 in ${file.path}:`,
+						content.substring(
+							Math.max(0, content.indexOf('base64,') - 80),
+							content.indexOf('base64,') + 120
+						));
+					processedFiles++;
+					continue;
+				}
+
+				log.info(`Processing ${file.path}: ${matches.length} image(s) found`,
+					matches.map(m => `[${m.syntax}: ${m.imageType}]`).join(', '));
+
+				let newContent = content;
+				let fileConversionCount = 0;
+
+				const filePath = file.path;
+				const fileDir = filePath.substring(0, filePath.lastIndexOf('/'));
+				const outputFolderPath = normalizePath(`${fileDir}/${this.settings.outputFolder}`);
+
+				try {
+					await this.app.vault.adapter.mkdir(outputFolderPath);
+				} catch (error) {
+					// Folder might already exist
+				}
+
+				for (let i = 0; i < matches.length; i++) {
+					const match = matches[i];
 
 					try {
-						await this.app.vault.adapter.mkdir(outputFolderPath);
-					} catch (error) {
-						// Folder might already exist, which is fine
-					}
+						const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+						const filename = this.settings.filenameFormat
+							.replace('{{date}}', timestamp)
+							.replace('{{index}}', (i + 1).toString())
+							.replace('{{type}}', match.imageType) + '.png';
 
-					// Process each match
-					for (let i = 0; i < matches.length; i++) {
-						const match = {
-							fullMatch: matches[i][0],
-							altText: matches[i][1],
-							imageType: matches[i][2],
-							base64Data: matches[i][3]
-						};
+						const imagePath = normalizePath(`${outputFolderPath}/${filename}`);
+						const relativeImagePath = normalizePath(`${this.settings.outputFolder}/${filename}`);
 
-						try {
-							// Generate filename
-							const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
-							const filename = this.settings.filenameFormat
-								.replace('{{date}}', timestamp)
-								.replace('{{index}}', (i + 1).toString())
-								.replace('{{type}}', match.imageType) + '.png';
+						log.debug(`Converting image ${i + 1}/${matches.length} in ${file.path}: syntax=${match.syntax}, type=${match.imageType}, base64 length=${match.base64Data.length}`);
 
-							const imagePath = normalizePath(`${outputFolderPath}/${filename}`);
-							const relativeImagePath = normalizePath(`${this.settings.outputFolder}/${filename}`);
+						const binaryData = base64ToArrayBuffer(match.base64Data);
+						await this.app.vault.adapter.writeBinary(imagePath, binaryData);
 
-							// 使用Obsidian API提供的base64ToArrayBuffer
-							const binaryData = base64ToArrayBuffer(match.base64Data);
-							await this.app.vault.adapter.writeBinary(imagePath, binaryData);
-
-							// Replace in content
-							const newImageMarkdown = `![${match.altText}](${relativeImagePath})`;
-							newContent = newContent.replace(match.fullMatch, newImageMarkdown);
-
-							fileConversionCount++;
-						} catch (error) {
-							console.error(`Error converting image in file ${file.path}:`, error);
+						const newImageMarkdown = `![${match.altText}](${relativeImagePath})`;
+						newContent = newContent.replace(match.fullMatch, newImageMarkdown);
+						if (match.syntax === 'reference' && match.refId) {
+							const refUsage = new RegExp(`!\\[([^\\]]*)\\]\\[${escapeRegex(match.refId)}\\]`, 'g');
+							newContent = newContent.replace(refUsage, (_, alt) => `![${alt}](${relativeImagePath})`);
+							const shortRefUsage = new RegExp(`!\\[${escapeRegex(match.refId)}\\](?!\\[|\\()`, 'g');
+							newContent = newContent.replace(shortRefUsage, `![${match.refId}](${relativeImagePath})`);
 						}
-					}
 
-					// Update the file content
-					if (fileConversionCount > 0) {
-						await this.app.vault.modify(file, newContent);
+						fileConversionCount++;
+						log.debug(`Image ${i + 1} in ${file.path} saved to ${imagePath}`);
+					} catch (error) {
+						log.error(`Error converting image ${i + 1} in ${file.path}:`, error);
 					}
-
-					totalConversions += fileConversionCount;
 				}
+
+				if (fileConversionCount > 0) {
+					await this.app.vault.modify(file, newContent);
+				}
+
+				totalConversions += fileConversionCount;
 
 				processedFiles++;
 				if (processedFiles % 10 === 0) {
@@ -315,7 +383,7 @@ export default class ConvertBase64ToPNGPlugin extends Plugin {
 			}
 		}
 
-		log.info(`Batch conversion complete: ${totalConversions} image(s) converted across ${files.length} files`);
+		log.info(`Batch conversion complete: ${totalConversions} image(s) converted, ${filesWithBase64} file(s) contained base64, ${files.length} total files scanned`);
 		new Notice(`Completed! Converted ${totalConversions} base64 image${totalConversions !== 1 ? 's' : ''} across ${files.length} files.`);
 	}
 }
