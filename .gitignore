@@ -4,6 +4,7 @@ node_modules/
 # Build files
 dist/
 build/
+output/
 
 # Images folder (not needed as SVGs are embedded)
 images/
