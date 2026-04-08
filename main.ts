@@ -1,22 +1,38 @@
 import { App, Editor, MarkdownView, Notice, Plugin, PluginSettingTab, Setting, TFile, normalizePath, base64ToArrayBuffer } from 'obsidian';
+import { createLogger } from '@tomelliot/obsidian-logger';
+
+const log = createLogger('Convert Base64 to PNG');
 
 interface ConvertBase64ToPNGSettings {
 	outputFolder: string;
 	autoConvert: boolean;
 	filenameFormat: string;
+	debugLogging: boolean;
 }
 
 const DEFAULT_SETTINGS: ConvertBase64ToPNGSettings = {
 	outputFolder: 'attachments',
 	autoConvert: false,
-	filenameFormat: 'image-{{date}}-{{index}}'
+	filenameFormat: 'image-{{date}}-{{index}}',
+	debugLogging: false,
 }
+
+const LOG_FILENAME = 'debug.log';
+const MAX_LOG_SIZE = 1024 * 1024; // 1 MB
 
 export default class ConvertBase64ToPNGPlugin extends Plugin {
 	settings: ConvertBase64ToPNGSettings;
 
 	async onload() {
 		await this.loadSettings();
+		this.configureFileLogging();
+
+		log.info('Plugin loaded, settings:', {
+			outputFolder: this.settings.outputFolder,
+			autoConvert: this.settings.autoConvert,
+			filenameFormat: this.settings.filenameFormat,
+			debugLogging: this.settings.debugLogging,
+		});
 
 		// Add command to convert base64 images in current file
 		this.addCommand({
@@ -41,12 +57,13 @@ export default class ConvertBase64ToPNGPlugin extends Plugin {
 
 		// Register event for auto-conversion if enabled
 		if (this.settings.autoConvert) {
+			log.debug('Auto-convert enabled, registering paste handler');
 			this.registerEvent(
 				this.app.workspace.on('editor-paste', (_: ClipboardEvent, editor: Editor) => {
-					// Check if pasted content contains base64 image
 					setTimeout(() => {
 						const content = editor.getValue();
 						if (this.containsBase64Image(content)) {
+							log.debug('Base64 image detected in paste, triggering auto-convert');
 							this.convertBase64ToPNG(editor, this.app.workspace.getActiveFile());
 						}
 					}, 100);
@@ -56,7 +73,44 @@ export default class ConvertBase64ToPNGPlugin extends Plugin {
 	}
 
 	onunload() {
-		// Clean up any resources
+		log.info('Plugin unloaded');
+	}
+
+	private configureFileLogging() {
+		const pluginDir = this.manifest.dir;
+		if (!pluginDir) {
+			log.warn('Plugin directory not available, file logging disabled');
+			return;
+		}
+
+		const logPath = normalizePath(`${pluginDir}/${LOG_FILENAME}`);
+
+		log.configureFileLogging({
+			isDebugEnabled: () => this.settings.debugLogging,
+			appendLine: async (line: string) => {
+				try {
+					let existing = '';
+					try {
+						existing = await this.app.vault.adapter.read(logPath);
+					} catch {
+						// File doesn't exist yet
+					}
+
+					// Rotate if too large
+					if (existing.length > MAX_LOG_SIZE) {
+						existing = existing.slice(existing.length - MAX_LOG_SIZE / 2);
+						const firstNewline = existing.indexOf('\n');
+						if (firstNewline !== -1) {
+							existing = existing.slice(firstNewline + 1);
+						}
+					}
+
+					await this.app.vault.adapter.write(logPath, existing + line);
+				} catch {
+					// Swallow errors to avoid affecting plugin behavior
+				}
+			},
+		});
 	}
 
 	async loadSettings() {
@@ -88,9 +142,12 @@ export default class ConvertBase64ToPNGPlugin extends Plugin {
 	// Main conversion function
 	async convertBase64ToPNG(editor: Editor, file: TFile | null) {
 		if (!file) {
+			log.warn('convertBase64ToPNG called with no active file');
 			new Notice('No file is currently open');
 			return;
 		}
+
+		log.info('Starting conversion for file:', file.path);
 
 		const content = editor.getValue();
 		const base64Regex = /!\[(.*?)\]\(data:image\/([a-zA-Z]+);base64,([^)]+)\)/g;
@@ -111,9 +168,12 @@ export default class ConvertBase64ToPNGPlugin extends Plugin {
 		}
 
 		if (matches.length === 0) {
+			log.debug('No base64 images found in file:', file.path);
 			new Notice('No base64 images found in the current file');
 			return;
 		}
+
+		log.info(`Found ${matches.length} base64 image(s) in file:`, file.path);
 
 		// Create output folder if it doesn't exist
 		const filePath = file.path;
@@ -141,7 +201,8 @@ export default class ConvertBase64ToPNGPlugin extends Plugin {
 				const imagePath = normalizePath(`${outputFolderPath}/${filename}`);
 				const relativeImagePath = normalizePath(`${this.settings.outputFolder}/${filename}`);
 
-				// 使用Obsidian API提供的base64ToArrayBuffer
+				log.debug(`Converting image ${i + 1}: type=${match.imageType}, base64 length=${match.base64Data.length}, output=${imagePath}`);
+
 				const binaryData = base64ToArrayBuffer(match.base64Data);
 				await this.app.vault.adapter.writeBinary(imagePath, binaryData);
 
@@ -150,8 +211,9 @@ export default class ConvertBase64ToPNGPlugin extends Plugin {
 				newContent = newContent.replace(match.fullMatch, newImageMarkdown);
 
 				conversionCount++;
+				log.debug(`Image ${i + 1} saved to ${imagePath}`);
 			} catch (error) {
-				console.error('Error converting base64 to PNG:', error);
+				log.error(`Error converting image ${i + 1}:`, error);
 				new Notice(`Error converting image ${i + 1}: ${error.message}`);
 			}
 		}
@@ -159,7 +221,7 @@ export default class ConvertBase64ToPNGPlugin extends Plugin {
 		// Update the file content
 		editor.setValue(newContent);
 
-		new Notice(`Converted ${conversionCount} base64 image${conversionCount !== 1 ? 's' : ''} to PNG`);
+		log.info(`Conversion complete: ${conversionCount}/${matches.length} images converted in ${file.path}`);
 	}
 
 	// Convert base64 images in all markdown files
@@ -168,6 +230,7 @@ export default class ConvertBase64ToPNGPlugin extends Plugin {
 		let totalConversions = 0;
 		let processedFiles = 0;
 
+		log.info(`Starting batch conversion across ${files.length} files`);
 		new Notice(`Processing ${files.length} files...`);
 
 		for (const file of files) {
@@ -247,11 +310,12 @@ export default class ConvertBase64ToPNGPlugin extends Plugin {
 					new Notice(`Processed ${processedFiles}/${files.length} files...`);
 				}
 			} catch (error) {
-				console.error(`Error processing file ${file.path}:`, error);
+				log.error(`Error processing file ${file.path}:`, error);
 				new Notice(`Error processing file ${file.path}: ${error.message}`);
 			}
 		}
 
+		log.info(`Batch conversion complete: ${totalConversions} image(s) converted across ${files.length} files`);
 		new Notice(`Completed! Converted ${totalConversions} base64 image${totalConversions !== 1 ? 's' : ''} across ${files.length} files.`);
 	}
 }
@@ -287,6 +351,16 @@ class ConvertBase64ToPNGSettingTab extends PluginSettingTab {
 				.setValue(this.plugin.settings.autoConvert)
 				.onChange(async (value) => {
 					this.plugin.settings.autoConvert = value;
+					await this.plugin.saveSettings();
+				}));
+
+		new Setting(containerEl)
+			.setName('Debug logging')
+			.setDesc('Enable debug logging to a file in the plugin directory')
+			.addToggle(toggle => toggle
+				.setValue(this.plugin.settings.debugLogging)
+				.onChange(async (value) => {
+					this.plugin.settings.debugLogging = value;
 					await this.plugin.saveSettings();
 				}));
 
