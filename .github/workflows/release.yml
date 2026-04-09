@@ -24,11 +24,11 @@ jobs:
             - name: List files
               run: |
                   ls -la
-                  ls -la build
+                  ls -la output
 
             - name: Create Release
               # https://github.com/ncipollo/release-action
               uses: ncipollo/release-action@v1.7.3
               with:
-                  artifacts: "build/main.js,build/manifest.json,build/styles.css"
+                  artifacts: "output/main.js,output/manifest.json,output/styles.css"
                   token: ${{ secrets.GITHUB_TOKEN }}

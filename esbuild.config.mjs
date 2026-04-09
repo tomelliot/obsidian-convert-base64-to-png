@@ -33,36 +33,47 @@ if (!prod && !process.env.DEV_PLUGIN_PATH) {
 const DEV_PLUGIN_PATH = process.env.DEV_PLUGIN_PATH || "";
 
 // --- Copy plugin ---
-const copyPlugin = {
-  name: "copy-to-dev-vault",
-  setup(build) {
-    if (prod) return;
+const outputDir = path.join(__dirname, "output");
 
+const copyPlugin = {
+  name: "copy-build-artifacts",
+  setup(build) {
     build.onEnd(() => {
       try {
-        const outputPath = path.join(__dirname, "output/main.js");
-        const targetMain = path.join(DEV_PLUGIN_PATH, "main.js");
-        const manifestTarget = path.join(DEV_PLUGIN_PATH, "manifest.json");
-
-        if (!fs.existsSync(DEV_PLUGIN_PATH)) {
-          console.error(`Target directory does not exist: ${DEV_PLUGIN_PATH}`);
-          console.error(
-            `Create it first: mkdir -p "${DEV_PLUGIN_PATH}"`
+        if (prod) {
+          // Production: copy manifest and styles into output/ for the release workflow
+          fs.copyFileSync(
+            path.join(__dirname, "manifest.json"),
+            path.join(outputDir, "manifest.json")
           );
-          return;
+          fs.copyFileSync(
+            path.join(__dirname, "styles.css"),
+            path.join(outputDir, "styles.css")
+          );
+          console.log("✓ Copied manifest.json and styles.css → output/");
+        } else {
+          // Dev: copy to vault plugin directory
+          const targetMain = path.join(DEV_PLUGIN_PATH, "main.js");
+          const manifestTarget = path.join(DEV_PLUGIN_PATH, "manifest.json");
+
+          if (!fs.existsSync(DEV_PLUGIN_PATH)) {
+            console.error(`Target directory does not exist: ${DEV_PLUGIN_PATH}`);
+            console.error(
+              `Create it first: mkdir -p "${DEV_PLUGIN_PATH}"`
+            );
+            return;
+          }
+
+          fs.copyFileSync(path.join(outputDir, "main.js"), targetMain);
+          console.log(`✓ Copied main.js → ${targetMain}`);
+
+          const devManifest = { ...manifest, version: "1.0.0" };
+          fs.writeFileSync(
+            manifestTarget,
+            JSON.stringify(devManifest, null, 2) + "\n"
+          );
+          console.log(`✓ Wrote dev manifest → ${manifestTarget}`);
         }
-
-        // Copy built JS
-        fs.copyFileSync(outputPath, targetMain);
-        console.log(`✓ Copied main.js → ${targetMain}`);
-
-        // Write dev manifest (pinned version prevents overriding production installs)
-        const devManifest = { ...manifest, version: "1.0.0" };
-        fs.writeFileSync(
-          manifestTarget,
-          JSON.stringify(devManifest, null, 2) + "\n"
-        );
-        console.log(`✓ Wrote dev manifest → ${manifestTarget}`);
       } catch (err) {
         console.error(`Copy failed: ${err.message}`);
       }
