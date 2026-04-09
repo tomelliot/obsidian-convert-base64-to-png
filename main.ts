@@ -154,28 +154,36 @@ export default class ConvertBase64ToPNGPlugin extends Plugin {
 			isDebugEnabled: () => this.settings.debugLogging,
 			appendLine: async (line: string) => {
 				try {
-					let existing = '';
-					try {
-						existing = await this.app.vault.adapter.read(logPath);
-					} catch {
-						// File doesn't exist yet
-					}
-
-					// Rotate if too large
-					if (existing.length > MAX_LOG_SIZE) {
-						existing = existing.slice(existing.length - MAX_LOG_SIZE / 2);
-						const firstNewline = existing.indexOf('\n');
-						if (firstNewline !== -1) {
-							existing = existing.slice(firstNewline + 1);
-						}
-					}
-
-					await this.app.vault.adapter.write(logPath, existing + line);
+					await this.app.vault.adapter.append(logPath, line);
 				} catch {
-					// Swallow errors to avoid affecting plugin behavior
+					// File may not exist yet — create it
+					try {
+						await this.app.vault.adapter.write(logPath, line);
+					} catch {
+						// Swallow errors to avoid affecting plugin behavior
+					}
 				}
 			},
 		});
+
+		this.rotateLogFile(logPath);
+	}
+
+	private async rotateLogFile(logPath: string) {
+		try {
+			const stat = await this.app.vault.adapter.stat(logPath);
+			if (stat && stat.size > MAX_LOG_SIZE) {
+				const existing = await this.app.vault.adapter.read(logPath);
+				const truncated = existing.slice(existing.length - MAX_LOG_SIZE / 2);
+				const firstNewline = truncated.indexOf('\n');
+				await this.app.vault.adapter.write(
+					logPath,
+					firstNewline !== -1 ? truncated.slice(firstNewline + 1) : truncated
+				);
+			}
+		} catch {
+			// Log file doesn't exist or can't be read — nothing to rotate
+		}
 	}
 
 	async loadSettings() {
